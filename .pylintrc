@@ -1,0 +1,31 @@
+[MASTER]
+persistent=yes
+ignore=CVS
+
+[MESSAGES CONTROL]
+# Disable the following PyLint messages:
+disable=C0111,  # missing-docstring
+        C0103,  # invalid-name
+        C0303,  # trailing-whitespace
+        W0311,  # bad-indentation
+        W0603,  # global-statement
+        R0903,  # too-few-public-methods
+        R0913,  # too-many-arguments
+        R0914   # too-many-locals
+
+[FORMAT]
+max-line-length=120
+indent-after-paren=4
+
+[BASIC]
+good-names=i,j,k,ex,Run,_,id,f
+
+[SIMILARITIES]
+min-similarity-lines=4
+ignore-comments=yes
+ignore-docstrings=yes
+ignore-imports=yes
+
+[TYPECHECK]
+# List of module names for which member attributes should not be checked
+ignored-modules=numpy,tensorflow,torch,cv2

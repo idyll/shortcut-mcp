@@ -8,11 +8,17 @@ This project is based on the original work by [Antonio Lorusso](https://github.c
 
 ## Features
 
-- View projects, stories, epics, and objectives
+- View stories, epics, objectives, and teams
 - Search through stories with advanced filtering options
 - Create new stories, epics, and objectives
 - Safe operations only (no updates or deletions)
 - Archived stories management (excluded by default, with option to include)
+
+## What's New in 0.2.3
+
+- **Project Deprecation**: Updated to use teams instead of projects, as projects have been deprecated by Shortcut
+- **Improved ID Handling**: Better support for both numeric IDs and UUID strings for teams and epics
+- **Enhanced Team Support**: Improved team assignment when creating and updating stories
 
 ## What's New in 0.2.2
 
@@ -84,11 +90,12 @@ After setup, you can now use the Shortcut tools directly in Claude Desktop. Try 
 - `list-my-stories` - View stories assigned to you
 - `list-stories-by-state-name` - View stories in a specific state
 - `advanced-search-stories` - Find stories with multiple filters
-- `list-projects` - See all available projects
 - `list-teams` - View all teams in your Shortcut workspace
 - `search-stories` - Find stories by keywords
 - `list-archived-stories` - View archived stories
 - `list-my-archived-stories` - View your archived stories
+
+> **Note**: Projects have been deprecated by Shortcut. The `list-projects` tool will now inform you to use teams instead. When creating or updating stories, please use `team_id` or `team_name` parameters instead of project-related parameters.
 
 ## Manual Usage
 

@@ -632,13 +632,13 @@ async def handle_list_tools() -> list[types.Tool]:
                         "description": "Story type (feature, bug, chore)",
                         "enum": ["feature", "bug", "chore"],
                     },
-                    "project_id": {
+                    "team_id": {
                         "type": "number",
-                        "description": "Project ID to create the story in",
+                        "description": "Team ID to create the story in (group_id in Shortcut API)",
                     },
-                    "project_name": {
+                    "team_name": {
                         "type": "string",
-                        "description": "Project name to create the story in (alternative to project_id)",
+                        "description": "Team name to create the story in (alternative to team_id)",
                     },
                     "epic_id": {
                         "type": "number",
@@ -658,7 +658,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="list-projects",
-            description="List all projects in Shortcut",
+            description="[DEPRECATED] List all projects in Shortcut. Projects have been deprecated by Shortcut, please use teams instead.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -810,14 +810,6 @@ async def handle_list_tools() -> list[types.Tool]:
                     "workflow_state_name": {
                         "type": "string",
                         "description": "New workflow state name (e.g., 'Backlog', 'In Development')",
-                    },
-                    "project_id": {
-                        "type": "number",
-                        "description": "New project ID for the story",
-                    },
-                    "project_name": {
-                        "type": "string",
-                        "description": "New project name for the story (alternative to project_id)",
                     },
                     "epic_id": {
                         "type": "number",
@@ -1251,53 +1243,79 @@ async def _handle_tool_implementation(
             if arguments is None:
                 arguments = {}
                 
-            project_id = arguments.get("project_id")
-            project_name = arguments.get("project_name")
             epic_id = arguments.get("epic_id")
             epic_name = arguments.get("epic_name")
+            team_id = arguments.get("team_id")
+            team_name = arguments.get("team_name")
             
-            # If neither project_id nor project_name is provided, list projects and ask user to select one
-            if not project_id and not project_name:
-                projects = await make_shortcut_request("GET", "projects")
-                
-                formatted_projects = []
-                for project in projects:
-                    formatted_projects.append(
-                        f"Project ID: {project['id']}\n"
-                        f"Name: {project['name']}\n"
-                        f"Description: {project.get('description', 'No description')}\n"
-                        "---"
-                    )
+            # If neither team_id nor team_name is provided, check if user is authenticated and has a team
+            # Otherwise, list teams and ask user to select one
+            if not team_id and not team_name:
+                # Check if user is authenticated and has a team
+                if shortcut_server.authenticated_user:
+                    team_ids = shortcut_server.authenticated_user.get("group_ids", [])
+                    if team_ids and len(team_ids) > 0:
+                        team_id = team_ids[0]  # Use the first team if multiple
+                    else:
+                        # User has no teams, list available teams
+                        teams = await make_shortcut_request("GET", "groups")
+                        
+                        formatted_teams = []
+                        for team in teams:
+                            formatted_teams.append(
+                                f"Team ID: {team['id']}\n"
+                                f"Name: {team['name']}\n"
+                                f"Description: {team.get('description', 'No description')}\n"
+                                "---"
+                            )
 
-                return [types.TextContent(
-                    type="text",
-                    text="Please provide either a project ID or project name from the list below and try again:\n\n" + 
-                         "\n".join(formatted_projects)
-                )]
+                        return [types.TextContent(
+                            type="text",
+                            text="Please provide either a team ID or team name from the list below and try again:\n\n" + 
+                                "\n".join(formatted_teams)
+                        )]
+                else:
+                    # User is not authenticated, list available teams
+                    teams = await make_shortcut_request("GET", "groups")
+                    
+                    formatted_teams = []
+                    for team in teams:
+                        formatted_teams.append(
+                            f"Team ID: {team['id']}\n"
+                            f"Name: {team['name']}\n"
+                            f"Description: {team.get('description', 'No description')}\n"
+                            "---"
+                        )
+
+                    return [types.TextContent(
+                        type="text",
+                        text="Please provide either a team ID or team name from the list below and try again:\n\n" + 
+                            "\n".join(formatted_teams)
+                    )]
             
-            # If project_name is provided, find the corresponding project_id
-            if project_name and not project_id:
-                projects = await make_shortcut_request("GET", "projects")
-                for project in projects:
-                    if project.get("name", "").lower() == project_name.lower():
-                        project_id = project.get("id")
+            # If team_name is provided, find the corresponding team_id
+            if team_name and not team_id:
+                teams = await make_shortcut_request("GET", "groups")
+                for team in teams:
+                    if team.get("name", "").lower() == team_name.lower():
+                        team_id = team.get("id")
                         break
                 
-                if not project_id:
-                    # If we couldn't find the project, list available projects
-                    formatted_projects = []
-                    for project in projects:
-                        formatted_projects.append(
-                            f"Project ID: {project['id']}\n"
-                            f"Name: {project['name']}\n"
-                            f"Description: {project.get('description', 'No description')}\n"
+                if not team_id:
+                    # If we couldn't find the team, list available teams
+                    formatted_teams = []
+                    for team in teams:
+                        formatted_teams.append(
+                            f"Team ID: {team['id']}\n"
+                            f"Name: {team['name']}\n"
+                            f"Description: {team.get('description', 'No description')}\n"
                             "---"
                         )
                     
                     return [types.TextContent(
                         type="text",
-                        text=f"Could not find project with name '{project_name}'. Available projects:\n\n" + 
-                             "\n".join(formatted_projects)
+                        text=f"Could not find team with name '{team_name}'. Available teams:\n\n" + 
+                            "\n".join(formatted_teams)
                     )]
             
             # If epic_name is provided, find the corresponding epic_id
@@ -1321,7 +1339,7 @@ async def _handle_tool_implementation(
                     return [types.TextContent(
                         type="text",
                         text=f"Could not find epic with name '{epic_name}'. Available epics:\n\n" + 
-                             "\n".join(formatted_epics)
+                            "\n".join(formatted_epics)
                     )]
             
             # Get the workflow state ID for "Backlog" or the specified state
@@ -1347,7 +1365,7 @@ async def _handle_tool_implementation(
                 return [types.TextContent(
                     type="text",
                     text=f"Could not find workflow state '{workflow_state_name}'. Available states:\n\n" + 
-                         "\n".join(formatted_workflows)
+                        "\n".join(formatted_workflows)
                 )]
             
             # Prepare story data
@@ -1355,22 +1373,19 @@ async def _handle_tool_implementation(
                 "name": arguments["name"],
                 "description": arguments["description"],
                 "story_type": arguments["story_type"],
-                "project_id": project_id,
                 "workflow_state_id": workflow_state_id,
             }
             
+            # Add group_id (team_id) if provided
+            if team_id:
+                # Shortcut API uses group_id for teams
+                # Team IDs can be either integers or UUIDs, so we don't need to convert
+                story_data["group_id"] = team_id
+            
             # Add epic_id if provided
             if epic_id:
-                try:
-                    # Convert epic_id to integer if it's a string
-                    if isinstance(epic_id, str):
-                        epic_id = int(epic_id)
-                    story_data["epic_id"] = epic_id
-                except ValueError:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid epic_id: {epic_id}. Must be a valid integer."
-                    )]
+                # Epic IDs can be either integers or UUIDs, so we don't need to convert
+                story_data["epic_id"] = epic_id
             
             # Handle epic_name if provided
             if epic_name := arguments.get("epic_name"):
@@ -1398,49 +1413,7 @@ async def _handle_tool_implementation(
                     return [types.TextContent(
                         type="text",
                         text=f"Could not find epic with name '{epic_name}'. Available epics:\n\n" + 
-                             "\n".join(formatted_epics)
-                    )]
-            
-            # Handle team_id if provided
-            if team_id := arguments.get("team_id"):
-                try:
-                    # Convert team_id to integer if it's a string
-                    if isinstance(team_id, str):
-                        team_id = int(team_id)
-                    story_data["group_id"] = team_id  # Shortcut API uses group_id for teams
-                except ValueError:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid team_id: {team_id}. Must be a valid integer."
-                    )]
-                
-            # Handle team_name if provided
-            if team_name := arguments.get("team_name"):
-                # Get all teams to find the team ID
-                teams = await make_shortcut_request("GET", "groups")
-                found_team_id = None
-                for team in teams:
-                    if team.get("name", "").lower() == team_name.lower():
-                        found_team_id = team.get("id")
-                        break
-                
-                if found_team_id:
-                    story_data["group_id"] = found_team_id  # Shortcut API uses group_id for teams
-                else:
-                    # If we couldn't find the team, list available teams
-                    formatted_teams = []
-                    for team in teams:
-                        formatted_teams.append(
-                            f"Team ID: {team['id']}\n"
-                            f"Name: {team['name']}\n"
-                            f"Description: {team.get('description', 'No description')}\n"
-                            "---"
-                        )
-                    
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Could not find team with name '{team_name}'. Available teams:\n\n" + 
-                             "\n".join(formatted_teams)
+                            "\n".join(formatted_epics)
                     )]
             
             # Assign to authenticated user if available
@@ -1470,20 +1443,9 @@ async def _handle_tool_implementation(
             if arguments is None:
                 arguments = {}
                 
-            projects = await make_shortcut_request("GET", "projects")
-            
-            formatted_projects = []
-            for project in projects:
-                formatted_projects.append(
-                    f"Project ID: {project['id']}\n"
-                    f"Name: {project['name']}\n"
-                    f"Description: {project.get('description', 'No description')}\n"
-                    "---"
-                )
-
             return [types.TextContent(
                 type="text",
-                text="Available projects:\n\n" + "\n".join(formatted_projects)
+                text="Projects have been deprecated by Shortcut. Please use teams instead. You can list teams using the list-teams tool."
             )]
 
         elif name == "list-teams":
@@ -2068,31 +2030,11 @@ async def _handle_tool_implementation(
             if story_type := arguments.get("story_type"):
                 story_data["story_type"] = story_type
                 
-            if project_id := arguments.get("project_id"):
-                try:
-                    # Convert project_id to integer if it's a string
-                    if isinstance(project_id, str):
-                        project_id = int(project_id)
-                    story_data["project_id"] = project_id
-                except ValueError:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid project_id: {project_id}. Must be a valid integer."
-                    )]
-                
             # Handle epic_id if provided
             if epic_id := arguments.get("epic_id"):
-                try:
-                    # Convert epic_id to integer if it's a string
-                    if isinstance(epic_id, str):
-                        epic_id = int(epic_id)
-                    story_data["epic_id"] = epic_id
-                except ValueError:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid epic_id: {epic_id}. Must be a valid integer."
-                    )]
-                
+                # Epic IDs can be either integers or UUIDs, so we don't need to convert
+                story_data["epic_id"] = epic_id
+            
             # Handle epic_name if provided
             if epic_name := arguments.get("epic_name"):
                 # Get all epics to find the epic ID
@@ -2124,17 +2066,10 @@ async def _handle_tool_implementation(
             
             # Handle team_id if provided
             if team_id := arguments.get("team_id"):
-                try:
-                    # Convert team_id to integer if it's a string
-                    if isinstance(team_id, str):
-                        team_id = int(team_id)
-                    story_data["group_id"] = team_id  # Shortcut API uses group_id for teams
-                except ValueError:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Invalid team_id: {team_id}. Must be a valid integer."
-                    )]
-                
+                # Shortcut API uses group_id for teams
+                # Team IDs can be either integers or UUIDs, so we don't need to convert
+                story_data["group_id"] = team_id
+            
             # Handle team_name if provided
             if team_name := arguments.get("team_name"):
                 # Get all teams to find the team ID

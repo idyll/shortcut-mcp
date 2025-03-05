@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2025-03-07
+
+### Changed
+
+- Updated `create-story` and `update-story` to use teams instead of projects, as projects have been deprecated by Shortcut
+- Modified `list-projects` tool to inform users that projects are deprecated and to use teams instead
+- Improved handling of team_id and epic_id parameters to support both numeric IDs and UUID strings
+
+### Fixed
+
+- Fixed issue with team_id handling that caused errors when using UUID-formatted team IDs
+- Fixed similar issue with epic_id handling to support UUID-formatted epic IDs
+
 ## [0.2.2] - 2025-03-06
 
 ### Added

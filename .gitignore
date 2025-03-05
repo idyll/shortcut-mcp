@@ -1,4 +1,55 @@
+# Environment variables
+.env
+.env.*
+!.env.example
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# UV
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Package manager
 uv.lock
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

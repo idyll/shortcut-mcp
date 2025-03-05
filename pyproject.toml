@@ -1,18 +1,32 @@
 [project]
 name = "shortcut-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Model Context Protocol (MCP) server for interacting with Shortcut"
+readme = "README.md"
 requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Mark Madsen"},{name = "Antonio Lorusso"}]
 dependencies = [
     "mcp",
     "httpx",
     "python-dotenv",
-    "pylint>=3.3.2",
 ]
+
+[project.urls]
+"Homepage" = "https://github.com/idyll/shortcut-mcp"
+"Bug Tracker" = "https://github.com/idyll/shortcut-mcp/issues"
+
+[project.scripts]
+shortcut-mcp = "shortcut_mcp.cli:main"
 
 [project.optional-dependencies]
 dev = [
-    "pylint"
+    "pylint>=3.3.2"
+]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0"
 ]
 
 [build-system]
@@ -24,3 +38,9 @@ packages = ["src/shortcut_mcp"]
 
 [tool.pylint]
 max-line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"

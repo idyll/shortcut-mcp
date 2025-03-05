@@ -1,6 +1,5 @@
-"""Main entry point for ShortcutMCP."""
-import asyncio
-from . import server
+"""Main entry point for shortcut-mcp."""
+from .cli import main
 
 if __name__ == "__main__":
-    asyncio.run(server.main())
+    main()

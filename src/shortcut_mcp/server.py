@@ -8,6 +8,10 @@ import mcp.types as types
 import mcp.server.stdio
 from dotenv import load_dotenv
 import re
+import random
+import time
+from contextlib import asynccontextmanager
+import sys
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,17 +20,73 @@ load_dotenv()
 API_BASE_URL = "https://api.app.shortcut.com/api/v3"
 SHORTCUT_API_TOKEN = os.getenv("SHORTCUT_API_TOKEN")
 
+# Custom exceptions for better error handling
+class ShortcutAPIError(Exception):
+    """Base exception for Shortcut API errors"""
+    pass
+
+class ShortcutAuthError(ShortcutAPIError):
+    """Authentication errors"""
+    pass
+    
+class ShortcutRateLimitError(ShortcutAPIError):
+    """Rate limit exceeded errors"""
+    pass
+    
+class ShortcutServerError(ShortcutAPIError):
+    """Server-side errors"""
+    pass
+
+class ShortcutTimeoutError(ShortcutAPIError):
+    """Timeout errors"""
+    pass
+
+class ShortcutConnectionError(ShortcutAPIError):
+    """Connection errors"""
+    pass
+
 # Cache for workflow states
 workflow_states_cache: Dict[int, str] = {}
 
 # Cache for member information
 members_cache = {}
 
+# HTTP client pool
+http_client = None
+
+@asynccontextmanager
+async def get_http_client():
+    """Get or create an HTTP client from the pool"""
+    global http_client
+    
+    # Create a new client if one doesn't exist
+    if http_client is None:
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=30.0)
+        http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
+    
+    try:
+        yield http_client
+    except Exception as e:
+        # If there's a connection error, reset the client
+        if isinstance(e, (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.PoolTimeout)):
+            await http_client.aclose()
+            http_client = None
+        raise
+
+async def cleanup_http_client():
+    """Close the HTTP client when shutting down"""
+    global http_client
+    if http_client is not None:
+        await http_client.aclose()
+        http_client = None
+
 # Create a ShortcutServer class to maintain state
 class ShortcutServer:
     def __init__(self, name: str):
         self.server = Server(name)
         self.authenticated_user = None
+        self.last_activity_time = time.time()
     
     async def initialize(self):
         """Initialize the server and authenticate with Shortcut"""
@@ -37,6 +97,14 @@ class ShortcutServer:
         except Exception as e:
             self.authenticated_user = None
             print(f"Warning: Authentication failed - {str(e)}")
+    
+    def update_activity(self):
+        """Update the last activity timestamp"""
+        self.last_activity_time = time.time()
+    
+    def get_inactivity_time(self):
+        """Get the time since the last activity in seconds"""
+        return time.time() - self.last_activity_time
 
 # Initialize with:
 shortcut_server = ShortcutServer("shortcut")
@@ -46,9 +114,11 @@ async def make_shortcut_request(
     method: str,
     endpoint: str,
     json: Optional[dict] = None,
-    params: Optional[dict] = None
+    params: Optional[dict] = None,
+    max_retries: int = 3,
+    base_timeout: float = 30.0
 ) -> dict[str, Any]:
-    """Make an authenticated request to the Shortcut API with safety checks"""
+    """Make an authenticated request to the Shortcut API with safety checks and retry logic"""
     
     # Safety check: Only allow GET, POST, and PUT methods
     if method not in ["GET", "POST", "PUT"]:
@@ -63,31 +133,83 @@ async def make_shortcut_request(
         raise ValueError(f"PUT requests are only allowed for updating stories, not for {endpoint}")
     
     if not SHORTCUT_API_TOKEN:
-        raise ValueError("SHORTCUT_API_TOKEN environment variable not set")
+        raise ShortcutAuthError("SHORTCUT_API_TOKEN environment variable not set")
 
     headers = {
         "Content-Type": "application/json",
         "Shortcut-Token": SHORTCUT_API_TOKEN
     }
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=method,
-                url=f"{API_BASE_URL}/{endpoint}",
-                headers=headers,
-                json=json,
-                params=params,
-                timeout=30.0
-            )
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as e:
-        raise httpx.HTTPError(f"HTTP error occurred: {str(e)} - Status code: {e.response.status_code}")
-    except httpx.RequestError as e:
-        raise ValueError(f"Request error occurred: {str(e)}")
-    except Exception as e:
-        raise ValueError(f"An unexpected error occurred: {str(e)}")
+    # Update the server's last activity time
+    shortcut_server.update_activity()
+
+    # Implement exponential backoff for retries
+    retry_count = 0
+    last_exception = None
+    
+    while retry_count < max_retries:
+        try:
+            # Use the connection pool
+            async with get_http_client() as client:
+                response = await client.request(
+                    method=method,
+                    url=f"{API_BASE_URL}/{endpoint}",
+                    headers=headers,
+                    json=json,
+                    params=params
+                )
+                response.raise_for_status()
+                return response.json()
+                
+        except httpx.TimeoutException as e:
+            last_exception = ShortcutTimeoutError(f"Request timed out: {str(e)}")
+            retry_count += 1
+            if retry_count < max_retries:
+                # Exponential backoff with jitter
+                backoff_time = (2 ** retry_count) + (0.1 * random.random())
+                print(f"Request timed out. Retrying in {backoff_time:.2f} seconds... (Attempt {retry_count}/{max_retries})")
+                await asyncio.sleep(backoff_time)
+            
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            
+            # Don't retry client errors (4xx) except for 429 (rate limit)
+            if status_code == 401:
+                raise ShortcutAuthError(f"Authentication failed: {str(e)}")
+            elif status_code == 429:
+                last_exception = ShortcutRateLimitError(f"Rate limit exceeded: {str(e)}")
+                retry_count += 1
+                # Get retry-after header or use exponential backoff
+                retry_after = int(e.response.headers.get('retry-after', 2 ** retry_count))
+                print(f"Rate limited. Retrying in {retry_after} seconds... (Attempt {retry_count}/{max_retries})")
+                await asyncio.sleep(retry_after)
+            elif 500 <= status_code < 600:
+                # Server errors (5xx) should be retried
+                last_exception = ShortcutServerError(f"Server error {status_code}: {str(e)}")
+                retry_count += 1
+                backoff_time = (2 ** retry_count) + (0.1 * random.random())
+                print(f"Server error {status_code}. Retrying in {backoff_time:.2f} seconds... (Attempt {retry_count}/{max_retries})")
+                await asyncio.sleep(backoff_time)
+            else:
+                # Client errors should not be retried
+                raise ShortcutAPIError(f"HTTP error occurred: {str(e)} - Status code: {status_code}")
+                
+        except httpx.RequestError as e:
+            # Network-related errors should be retried
+            last_exception = ShortcutConnectionError(f"Connection error: {str(e)}")
+            retry_count += 1
+            if retry_count < max_retries:
+                backoff_time = (2 ** retry_count) + (0.1 * random.random())
+                print(f"Request error. Retrying in {backoff_time:.2f} seconds... (Attempt {retry_count}/{max_retries})")
+                await asyncio.sleep(backoff_time)
+                
+        except Exception as e:
+            # Unexpected errors should not be retried
+            raise ShortcutAPIError(f"An unexpected error occurred: {str(e)}")
+    
+    # If we've exhausted all retries
+    if last_exception:
+        raise last_exception
 
 async def get_workflow_state_name(workflow_state_id: int) -> str:
     """Get the name of a workflow state by ID"""
@@ -151,19 +273,9 @@ async def find_workflow_state_id(workflow_state_name: str) -> tuple[int, str]:
     return None, None
 
 async def find_epic_by_name(epic_name: str) -> tuple[int, str]:
-    """Find an epic by name, with support for partial matching.
-    
-    Returns:
-        tuple: (epic_id, actual_epic_name) or (None, None) if not found
-    """
+    """Find an epic by name"""
     epics = await make_shortcut_request("GET", "epics")
     
-    # First try exact match (case-insensitive)
-    for epic in epics:
-        if epic.get("name", "").lower() == epic_name.lower():
-            return epic.get("id"), epic.get("name")
-    
-    # If no exact match, try partial match
     for epic in epics:
         if epic_name.lower() in epic.get("name", "").lower():
             return epic.get("id"), epic.get("name")
@@ -190,129 +302,246 @@ def format_epic(epic: dict) -> str:
     )
 
 async def format_story(story: dict) -> str:
-    """Format a story into a readable string"""
-    # Get the workflow state name asynchronously if needed
+    """Format a story into a readable string with optimized async calls"""
+    # Prepare all coroutines we need to run in parallel
+    tasks = []
+    task_types = []
+    
+    # Get workflow state name if needed
     workflow_state_id = story.get("workflow_state_id")
-    workflow_state_name = "Unknown"
+    if workflow_state_id is not None and workflow_state_id not in workflow_states_cache:
+        tasks.append(get_workflow_state_name(workflow_state_id))
+        task_types.append("workflow_state")
     
-    # If we have the workflow state ID, try to get the name from cache
-    if workflow_state_id is not None and workflow_state_id in workflow_states_cache:
-        workflow_state_name = workflow_states_cache[workflow_state_id]
-    elif workflow_state_id is not None:
-        workflow_state_name = await get_workflow_state_name(workflow_state_id)
-    
-    # Get owner and requestor information
+    # Get owner names if needed
     owners = story.get("owner_ids", [])
+    for owner_id in owners:
+        if owner_id and owner_id not in members_cache:
+            tasks.append(get_member_name(owner_id))
+            task_types.append(f"owner_{owner_id}")
+    
+    # Get requestor name if needed
+    requestor_id = story.get("requested_by_id")
+    if requestor_id and requestor_id not in members_cache:
+        tasks.append(get_member_name(requestor_id))
+        task_types.append(f"requestor_{requestor_id}")
+    
+    # Run all tasks in parallel if we have any
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        
+        # Process results based on task types
+        for i, result in enumerate(results):
+            task_type = task_types[i]
+            if task_type == "workflow_state":
+                # We don't need to do anything here as the cache is updated in get_workflow_state_name
+                pass
+            elif task_type.startswith("owner_") or task_type.startswith("requestor_"):
+                # We don't need to do anything here as the cache is updated in get_member_name
+                pass
+    
+    # Now format the story with all the data we have
+    story_id = story.get("id")
+    name = story.get("name", "Untitled")
+    description = story.get("description", "").strip()
+    
+    # Get workflow state name from cache
+    workflow_state_name = "Unknown"
+    if workflow_state_id is not None:
+        workflow_state_name = workflow_states_cache.get(workflow_state_id, "Unknown")
+    
+    # Get owner names from cache
     owner_names = []
     for owner_id in owners:
-        if owner_id:  # Only process non-empty owner IDs
-            owner_name = await get_member_name(owner_id)
+        if owner_id:
+            owner_name = members_cache.get(owner_id, "Unknown")
             owner_names.append(owner_name)
     
-    owner_info = f"Owners: {', '.join(owner_names)}" if owner_names else "No owners assigned"
-    
-    # Get team information
-    team_id = story.get("group_id")
-    team_info = "No team assigned"
-    if team_id:
-        try:
-            teams = await make_shortcut_request("GET", "groups")
-            for team in teams:
-                if team.get("id") == team_id:
-                    team_info = f"Team: {team.get('name', 'Unknown')}"
-                    break
-        except Exception:
-            pass
-    
-    # Get epic information
-    epic_id = story.get("epic_id")
-    epic_info = "No epic assigned"
-    if epic_id:
-        try:
-            epic = await make_shortcut_request("GET", f"epics/{epic_id}")
-            epic_info = f"Epic: {epic.get('name', 'Unknown')} (ID: {epic_id})"
-        except Exception:
-            pass
-    
-    requestor_id = story.get("requested_by_id")
+    # Get requestor name from cache
     requestor_name = "Unknown"
     if requestor_id:
-        requestor_name = await get_member_name(requestor_id)
+        requestor_name = members_cache.get(requestor_id, "Unknown")
     
-    requestor_info = f"Requested by: {requestor_name}" if requestor_id else "No requestor information"
+    # Format the story
+    formatted_story = f"Story {story_id}: {name}\n"
+    formatted_story += f"Status: {workflow_state_name}\n"
     
-    # Get creation and update times
-    created_at = story.get("created_at", "Unknown")
-    updated_at = story.get("updated_at", "Unknown")
+    if owner_names:
+        formatted_story += f"Owners: {', '.join(owner_names)}\n"
     
-    return (
-        f"Story {story['id']}: {story['name']}\n"
-        f"Status: {workflow_state_name}\n"
-        f"Type: {story.get('story_type', 'Unknown')}\n"
-        f"{owner_info}\n"
-        f"{team_info}\n"
-        f"{epic_info}\n"
-        f"{requestor_info}\n"
-        f"Created: {created_at}\n"
-        f"Updated: {updated_at}\n"
-        f"Description: {story.get('description', 'No description')}\n"
-        f"URL: {story.get('app_url', '')}\n"
-        "---"
-    )
+    formatted_story += f"Requestor: {requestor_name}\n"
+    
+    if description:
+        # Truncate description if it's too long
+        if len(description) > 500:
+            description = description[:497] + "..."
+        formatted_story += f"Description: {description}\n"
+    
+    return formatted_story
+
+async def format_story_detailed(story: dict) -> str:
+    """Format a story into a detailed readable string with all available information"""
+    # Prepare all coroutines we need to run in parallel
+    tasks = []
+    task_types = []
+    
+    # Get workflow state name if needed
+    workflow_state_id = story.get("workflow_state_id")
+    if workflow_state_id is not None and workflow_state_id not in workflow_states_cache:
+        tasks.append(get_workflow_state_name(workflow_state_id))
+        task_types.append("workflow_state")
+    
+    # Get owner names if needed
+    owners = story.get("owner_ids", [])
+    for owner_id in owners:
+        if owner_id and owner_id not in members_cache:
+            tasks.append(get_member_name(owner_id))
+            task_types.append(f"owner_{owner_id}")
+    
+    # Get requestor name if needed
+    requestor_id = story.get("requested_by_id")
+    if requestor_id and requestor_id not in members_cache:
+        tasks.append(get_member_name(requestor_id))
+        task_types.append(f"requestor_{requestor_id}")
+    
+    # Get epic information if needed
+    epic_id = story.get("epic_id")
+    epic_info = None
+    if epic_id:
+        tasks.append(make_shortcut_request("GET", f"epics/{epic_id}"))
+        task_types.append("epic")
+    
+    # Run all tasks in parallel if we have any
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results based on task types
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Skip failed requests
+                continue
+                
+            task_type = task_types[i]
+            if task_type == "workflow_state":
+                # We don't need to do anything here as the cache is updated in get_workflow_state_name
+                pass
+            elif task_type.startswith("owner_") or task_type.startswith("requestor_"):
+                # We don't need to do anything here as the cache is updated in get_member_name
+                pass
+            elif task_type == "epic":
+                epic_info = result
+    
+    # Now format the story with all the data we have
+    story_id = story.get("id")
+    name = story.get("name", "Untitled")
+    description = story.get("description", "").strip()
+    story_type = story.get("story_type", "Unknown")
+    app_url = story.get("app_url", "")
+    
+    # Get workflow state name from cache
+    workflow_state_name = "Unknown"
+    if workflow_state_id is not None:
+        workflow_state_name = workflow_states_cache.get(workflow_state_id, "Unknown")
+    
+    # Get owner names from cache
+    owner_names = []
+    for owner_id in owners:
+        if owner_id:
+            owner_name = members_cache.get(owner_id, "Unknown")
+            owner_names.append(owner_name)
+    
+    # Get requestor name from cache
+    requestor_name = "Unknown"
+    if requestor_id:
+        requestor_name = members_cache.get(requestor_id, "Unknown")
+    
+    # Format dates
+    created_at = story.get("created_at")
+    updated_at = story.get("updated_at")
+    
+    # Format the story
+    formatted_story = f"Story {story_id}: {name}\n"
+    formatted_story += f"Status: {workflow_state_name}\n"
+    formatted_story += f"Type: {story_type}\n"
+    
+    if owner_names:
+        formatted_story += f"Owners: {', '.join(owner_names)}\n"
+    else:
+        formatted_story += "Owners: None\n"
+    
+    formatted_story += f"Requestor: {requestor_name}\n"
+    
+    # Add epic information if available
+    if epic_info:
+        formatted_story += f"Epic: {epic_info.get('name', 'Unknown')} (ID: {epic_id})\n"
+    
+    # Add dates
+    if created_at:
+        formatted_story += f"Created: {created_at}\n"
+    if updated_at:
+        formatted_story += f"Updated: {updated_at}\n"
+    
+    # Add URL
+    if app_url:
+        formatted_story += f"URL: {app_url}\n"
+    
+    # Add description
+    if description:
+        formatted_story += f"\nDescription:\n{description}\n"
+    else:
+        formatted_story += "\nNo description provided.\n"
+    
+    return formatted_story
 
 @shortcut_server.server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    """List available tools for the Shortcut MCP server."""
-    # Add user info to tool descriptions if authenticated
-    user_info = ""
-    if shortcut_server.authenticated_user:
-        user_name = shortcut_server.authenticated_user.get("name", "Unknown")
-        user_info = f" (authenticated as {user_name})"
-    
+    """List available tools"""
     return [
         types.Tool(
             name="search-stories",
-            description=f"Search for stories in Shortcut{user_info}",
+            description="Search for stories in Shortcut using powerful search operators",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query (e.g., 'is:story state:\"In Development\" owner:me')"
+                        "description": "Search query with optional operators (e.g., 'SMS type:feature state:\"In Development\" owner:john label:urgent'). Supports operators like type:, state:, owner:, label:, has:attachment, is:blocked, etc."
                     },
                     "owner_name": {
                         "type": "string",
-                        "description": "Filter by owner name (person assigned to the story)"
+                        "description": "Filter by owner name (person assigned to the story). Will be converted to owner:mention_name in the query."
                     },
                     "requestor_name": {
                         "type": "string",
-                        "description": "Filter by requestor name (person who requested the story)"
+                        "description": "Filter by requestor name (person who requested the story). Will be converted to requester:mention_name in the query."
                     },
                     "state_name": {
                         "type": "string",
-                        "description": "Filter by workflow state name (e.g., 'In Development', 'Ready for Review')"
+                        "description": "Filter by workflow state name (e.g., 'In Development', 'Ready for Review'). Will be converted to state:\"name\" in the query."
                     },
                     "created_after": {
                         "type": "string",
-                        "description": "Filter stories created after this date (YYYY-MM-DD)"
+                        "description": "Filter by creation date (YYYY-MM-DD). Can use 'yesterday' or 'today'. Will be converted to created:date..* in the query."
                     },
                     "created_before": {
                         "type": "string",
-                        "description": "Filter stories created before this date (YYYY-MM-DD)"
-                    },
-                    "updated_after": {
-                        "type": "string",
-                        "description": "Filter stories updated after this date (YYYY-MM-DD)"
-                    },
-                    "updated_before": {
-                        "type": "string",
-                        "description": "Filter stories updated before this date (YYYY-MM-DD)"
-                    },
-                    "include_archived": {
-                        "type": "boolean",
-                        "description": "Include archived stories (default: false)"
+                        "description": "Filter by creation date (YYYY-MM-DD). Can use 'yesterday' or 'today'. Will be converted to created:*..date in the query."
                     }
                 }
+            }
+        ),
+        types.Tool(
+            name="get-story",
+            description="Get detailed information about a specific story by ID (fastest way to look up a story)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "story_id": {
+                        "type": "string",
+                        "description": "The ID of the story to retrieve (numeric ID only)"
+                    }
+                },
+                "required": ["story_id"]
             }
         ),
         types.Tool(
@@ -386,7 +615,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="create-story",
-            description=f"Create a new story in Shortcut{user_info}",
+            description=f"Create a new story in Shortcut",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -476,7 +705,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="create-objective",
-            description=f"Create a new objective in Shortcut{user_info}",
+            description=f"Create a new objective in Shortcut",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -513,7 +742,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="create-epic",
-            description=f"Create a new epic in Shortcut{user_info}",
+            description=f"Create a new epic in Shortcut",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -557,7 +786,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="update-story",
-            description=f"Update an existing story in Shortcut{user_info}",
+            description=f"Update an existing story in Shortcut",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -612,7 +841,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="update-story-status",
-            description=f"Update a story's status in Shortcut{user_info}",
+            description=f"Update a story's status in Shortcut",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -628,6 +857,14 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["story_id", "status"],
             },
         ),
+        types.Tool(
+            name="health-check",
+            description="Check the health and connectivity of the Shortcut MCP server",
+            inputSchema={
+                "type": "object",
+                "properties": {}  # No required parameters
+            }
+        ),
     ]
 
 @shortcut_server.server.call_tool()
@@ -640,6 +877,78 @@ async def handle_call_tool(
     if arguments is None:
         arguments = {}
 
+    # Create a wrapper function to apply timeout to the actual handler
+    async def execute_with_timeout(timeout=60.0):
+        try:
+            # Execute the actual tool handler with a timeout
+            return await asyncio.wait_for(
+                _handle_tool_implementation(name, arguments),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return [types.TextContent(
+                type="text",
+                text=f"⏱️ The operation timed out after {timeout} seconds. Please try again with a more specific query or check if the Shortcut API is responding."
+            )]
+        except ShortcutAuthError as e:
+            return [types.TextContent(
+                type="text",
+                text=f"🔑 Authentication error. Please check your API token. Details: {e}"
+            )]
+        except ShortcutRateLimitError as e:
+            return [types.TextContent(
+                type="text",
+                text=f"⚠️ Rate limit exceeded. Please try again in a few minutes. Details: {e}"
+            )]
+        except ShortcutServerError as e:
+            return [types.TextContent(
+                type="text",
+                text=f"⚠️ Shortcut server is experiencing issues. Please try again later. Details: {e}"
+            )]
+        except ShortcutTimeoutError as e:
+            return [types.TextContent(
+                type="text",
+                text=f"⏱️ Request timed out. The Shortcut API might be slow or unresponsive. Details: {e}"
+            )]
+        except ShortcutConnectionError as e:
+            return [types.TextContent(
+                type="text",
+                text=f"🌐 Connection error. There might be network issues. Details: {e}"
+            )]
+        except ShortcutAPIError as e:
+            return [types.TextContent(
+                type="text",
+                text=f"❌ Shortcut API error: {e}"
+            )]
+        except Exception as e:
+            # Log the full exception for debugging
+            print(f"Unexpected error in {name}: {type(e).__name__}: {e}", file=sys.stderr)
+            return [types.TextContent(
+                type="text",
+                text=f"An unexpected error occurred. Please try again or simplify your request."
+            )]
+    
+    # Determine an appropriate timeout based on the tool being called
+    if name == "search-stories":
+        # Search operations can take longer
+        timeout = 90.0
+    elif name == "get-story":
+        # Direct lookups should be fast
+        timeout = 30.0
+    elif name in ["list-epics", "list-members", "list-stories-by-state-name"]:
+        # List operations might take longer
+        timeout = 60.0
+    else:
+        # Default timeout for other operations
+        timeout = 45.0
+        
+    return await execute_with_timeout(timeout)
+
+async def _handle_tool_implementation(
+    name: str,
+    arguments: dict
+) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+    """Actual implementation of tool handling logic"""
     try:
         if name == "search-stories":
             query = arguments.get("query", "")
@@ -648,175 +957,288 @@ async def handle_call_tool(
             state_name = arguments.get("state_name")
             created_after = arguments.get("created_after")
             created_before = arguments.get("created_before")
-            updated_after = arguments.get("updated_after")
-            updated_before = arguments.get("updated_before")
-            include_archived = arguments.get("include_archived", False)
             
-            # Parse the query string if provided
-            if query:
-                # Extract parameters from the query string
-                
-                # Extract state
-                state_match = re.search(r'state:["\'"]?([^"\'\s]+)["\'"]?', query)
-                if state_match and not state_name:
-                    state_name = state_match.group(1)
-                
-                # Extract owner
-                owner_match = re.search(r'owner:([^\s]+)', query)
-                if owner_match and not owner_name:
-                    owner_value = owner_match.group(1)
-                    if owner_value.lower() == 'me':
-                        # Use the authenticated user
-                        if shortcut_server.authenticated_user:
-                            owner_name = shortcut_server.authenticated_user.get("name")
-                    else:
-                        owner_name = owner_value
-                
-                # Extract created_by
-                created_by_match = re.search(r'created_by:([^\s]+)', query)
-                if created_by_match:
-                    created_by_value = created_by_match.group(1)
-                    if created_by_value.lower() == 'me':
-                        # Use the authenticated user as requestor
-                        if shortcut_server.authenticated_user:
-                            requestor_name = shortcut_server.authenticated_user.get("name")
-                    else:
-                        requestor_name = created_by_value
-                
-                # Extract archived status
-                archived_match = re.search(r'archived:(true|false)', query, re.IGNORECASE)
-                if archived_match:
-                    include_archived = archived_match.group(1).lower() == 'true'
+            # Check if the query looks like a story ID (just numbers)
+            if query and re.match(r'^\d+$', query.strip()):
+                # This looks like a story ID, suggest using get-story instead
+                story_id = query.strip()
+                return [types.TextContent(
+                    type="text",
+                    text=f"It looks like you're searching for a specific story ID ({story_id}). For faster results, please use the get-story tool instead of search-stories."
+                )]
             
-            search_json = {}
+            # Build a proper Shortcut search query string using their query syntax
+            search_query_parts = []
             filter_description = []
             
-            # Set archived status (default to false unless explicitly included)
-            search_json["archived"] = include_archived
-            if include_archived:
-                filter_description.append("including archived stories")
-            else:
-                filter_description.append("excluding archived stories")
+            # Add the basic text search if provided
+            if query:
+                # If the query already contains search operators, use it as is
+                if any(op in query for op in [":", "is:", "has:", "type:", "state:", "owner:", "label:"]):
+                    search_query_parts.append(query)
+                    filter_description.append(f"matching '{query}'")
+                else:
+                    # Otherwise, use it as a general text search
+                    search_query_parts.append(query)
+                    filter_description.append(f"matching '{query}'")
             
-            # Handle owner filter
+            # Add owner filter if provided
             if owner_name:
-                # Get all members to find the owner ID
-                members = await make_shortcut_request("GET", "members")
-                owner_id = None
-                for member in members:
-                    if member.get("name", "").lower() == owner_name.lower() or member.get("mention_name", "").lower() == owner_name.lower():
-                        owner_id = member.get("id")
-                        break
-                
-                if owner_id:
-                    search_json["owner_ids"] = [owner_id]
-                    filter_description.append(f"owned by {owner_name}")
-                else:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Could not find member with name '{owner_name}'"
-                    )]
-            
-            # Handle requestor filter
-            if requestor_name:
-                # Get all members to find the requestor ID
-                members = await make_shortcut_request("GET", "members")
-                requestor_id = None
-                for member in members:
-                    if member.get("name", "").lower() == requestor_name.lower() or member.get("mention_name", "").lower() == requestor_name.lower():
-                        requestor_id = member.get("id")
-                        break
-                
-                if requestor_id:
-                    search_json["requested_by_id"] = requestor_id
-                    filter_description.append(f"requested by {requestor_name}")
-                else:
-                    return [types.TextContent(
-                        type="text",
-                        text=f"Could not find member with name '{requestor_name}'"
-                    )]
-            
-            # Handle workflow state filter
-            if state_name:
-                # Get all workflows to find the workflow state ID
-                workflows = await make_shortcut_request("GET", "workflows")
-                workflow_state_id = None
-                for workflow in workflows:
-                    for state in workflow.get("states", []):
-                        if state["name"].lower() == state_name.lower():
-                            workflow_state_id = state["id"]
-                            # Cache the state name
-                            workflow_states_cache[state["id"]] = state["name"]
+                try:
+                    # Find the member ID for the given name
+                    members = await make_shortcut_request("GET", "members")
+                    owner_mention = None
+                    
+                    for member in members:
+                        profile = member.get("profile", {})
+                        if owner_name.lower() in profile.get("name", "").lower():
+                            # Get the mention name (without @)
+                            owner_mention = profile.get("mention_name")
                             break
-                    if workflow_state_id:
-                        break
-                
-                if workflow_state_id:
-                    search_json["workflow_state_id"] = workflow_state_id
-                    filter_description.append(f"in state '{state_name}'")
-                else:
+                    
+                    if owner_mention:
+                        search_query_parts.append(f"owner:{owner_mention}")
+                        filter_description.append(f"owned by '{owner_name}'")
+                    else:
+                        return [types.TextContent(
+                            type="text",
+                            text=f"Could not find a member with name '{owner_name}'"
+                        )]
+                except Exception as e:
                     return [types.TextContent(
                         type="text",
-                        text=f"Could not find workflow state with name '{state_name}'"
+                        text=f"Error finding member: {str(e)}"
                     )]
             
-            # Handle time-based filters
-            if created_after:
-                search_json["created_at_start"] = f"{created_after}T00:00:00Z"
-                filter_description.append(f"created after {created_after}")
+            # Add requestor filter if provided
+            if requestor_name:
+                try:
+                    # Find the member ID for the given name
+                    members = await make_shortcut_request("GET", "members")
+                    requestor_mention = None
+                    
+                    for member in members:
+                        profile = member.get("profile", {})
+                        if requestor_name.lower() in profile.get("name", "").lower():
+                            # Get the mention name (without @)
+                            requestor_mention = profile.get("mention_name")
+                            break
+                    
+                    if requestor_mention:
+                        search_query_parts.append(f"requester:{requestor_mention}")
+                        filter_description.append(f"requested by '{requestor_name}'")
+                    else:
+                        return [types.TextContent(
+                            type="text",
+                            text=f"Could not find a member with name '{requestor_name}'"
+                        )]
+                except Exception as e:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Error finding member: {str(e)}"
+                    )]
             
-            if created_before:
-                search_json["created_at_end"] = f"{created_before}T23:59:59Z"
+            # Add workflow state filter if provided
+            if state_name:
+                # Use the state: operator with quotes for multi-word state names
+                if " " in state_name:
+                    search_query_parts.append(f'state:"{state_name}"')
+                else:
+                    search_query_parts.append(f'state:{state_name}')
+                filter_description.append(f"in state '{state_name}'")
+            
+            # Add date filters if provided
+            if created_after and created_before:
+                search_query_parts.append(f"created:{created_after}..{created_before}")
+                filter_description.append(f"created between {created_after} and {created_before}")
+            elif created_after:
+                search_query_parts.append(f"created:{created_after}..*")
+                filter_description.append(f"created after {created_after}")
+            elif created_before:
+                search_query_parts.append(f"created:*..{created_before}")
                 filter_description.append(f"created before {created_before}")
             
-            if updated_after:
-                search_json["updated_at_start"] = f"{updated_after}T00:00:00Z"
-                filter_description.append(f"updated after {updated_after}")
+            # Add is:story to ensure we only get stories
+            search_query_parts.append("is:story")
             
-            if updated_before:
-                search_json["updated_at_end"] = f"{updated_before}T23:59:59Z"
-                filter_description.append(f"updated before {updated_before}")
+            # Combine all query parts with spaces (AND logic)
+            search_query = " ".join(search_query_parts)
             
-            # If no filters were provided, return an error
-            if not search_json:
+            # Provide feedback that the search is in progress
+            progress_message = "Searching for stories"
+            if filter_description:
+                progress_message += " " + " and ".join(filter_description)
+            progress_message += "... (this may take a moment)"
+            
+            print(progress_message)
+            
+            try:
+                # Try using the GET search endpoint with the proper query syntax
+                try:
+                    # Set a longer timeout for search operations
+                    search_results = await make_shortcut_request(
+                        "GET", 
+                        "search/stories", 
+                        params={"query": search_query},
+                        max_retries=2,
+                        base_timeout=45.0  # Longer timeout for search
+                    )
+                    
+                    stories = search_results.get("data", [])
+                except Exception as e:
+                    print(f"GET search failed: {e}")
+                    # Fall back to the POST search endpoint with structured parameters
+                    search_params = {"archived": False}  # Default to non-archived stories
+                    
+                    # Try to convert our query to structured parameters
+                    if owner_name and "owner_ids" in locals() and owner_id:
+                        search_params["owner_ids"] = [owner_id]
+                    
+                    if requestor_name and "requestor_id" in locals() and requestor_id:
+                        search_params["requested_by_id"] = requestor_id
+                    
+                    if state_name and "workflow_state_id" in locals() and workflow_state_id:
+                        search_params["workflow_state_id"] = workflow_state_id
+                    
+                    if created_after:
+                        search_params["created_at_start"] = created_after
+                    
+                    if created_before:
+                        search_params["created_at_end"] = created_before
+                    
+                    # Add text search if it's a simple query
+                    if query and not any(op in query for op in [":", "is:", "has:"]):
+                        search_params["text"] = query
+                    
+                    stories = await make_shortcut_request(
+                        "POST", 
+                        "stories/search", 
+                        json=search_params,
+                        max_retries=2,
+                        base_timeout=45.0  # Longer timeout for search
+                    )
+                
+                # Format the stories
+                if stories:
+                    # Limit the number of stories to process to avoid timeouts
+                    max_stories = 10
+                    if len(stories) > max_stories:
+                        truncated_message = f"\n\n(Showing {max_stories} of {len(stories)} stories. Use more specific search criteria to narrow results.)"
+                        stories = stories[:max_stories]
+                    else:
+                        truncated_message = ""
+                    
+                    # Process stories in parallel for better performance
+                    formatted_stories = await asyncio.gather(*[format_story(story) for story in stories])
+                    
+                    # Join the formatted stories with a separator
+                    stories_text = "\n\n".join(formatted_stories)
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Found {len(stories)} stories matching your criteria:{truncated_message}\n\n{stories_text}"
+                    )]
+                else:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"No stories found matching your criteria. Search query: {search_query}"
+                    )]
+            except ShortcutTimeoutError:
                 return [types.TextContent(
                     type="text",
-                    text="Please provide at least one search filter"
+                    text="⏱️ The search operation timed out. Please try again with more specific search criteria to narrow down the results."
                 )]
-            
-            # Search for stories
-            stories = await make_shortcut_request(
-                "POST",
-                "stories/search",
-                json=search_json
-            )
-            
-            if not stories:
-                filter_text = " and ".join(filter_description)
-                return [types.TextContent(
-                    type="text",
-                    text=f"No stories found {filter_text}"
-                )]
-            
-            # Collect all unique workflow state IDs from the stories
-            workflow_state_ids = set()
-            for story in stories:
-                if story.get("workflow_state_id"):
-                    workflow_state_ids.add(story.get("workflow_state_id"))
-            
-            # Populate the cache with workflow state names
-            for state_id in workflow_state_ids:
-                if state_id not in workflow_states_cache:
-                    state_name = await get_workflow_state_name(state_id)
-                    workflow_states_cache[state_id] = state_name
-            
-            formatted_stories = [await format_story(story) for story in stories]
-            filter_text = " and ".join(filter_description)
-            return [types.TextContent(
-                type="text",
-                text=f"Found stories {filter_text}:\n\n" + "\n".join(formatted_stories)
-            )]
-        
+            except Exception as e:
+                # If all search methods fail, try a simpler approach - list all stories and filter client-side
+                try:
+                    print(f"Search failed, falling back to listing all stories: {e}")
+                    # Get all stories and filter client-side
+                    all_stories = await make_shortcut_request("GET", "stories", max_retries=2, base_timeout=60.0)
+                    
+                    # Filter stories based on search criteria
+                    filtered_stories = []
+                    for story in all_stories:
+                        # Apply text search if provided
+                        if query and not any(op in query for op in [":", "is:", "has:"]):
+                            search_text = query.lower()
+                            story_name = story.get("name", "").lower()
+                            story_desc = story.get("description", "").lower()
+                            
+                            if search_text not in story_name and search_text not in story_desc:
+                                continue
+                        
+                        # Apply workflow state filter if provided
+                        if state_name:
+                            # Get the workflow state name for this story
+                            story_state_id = story.get("workflow_state_id")
+                            if story_state_id:
+                                story_state_name = await get_workflow_state_name(story_state_id)
+                                if state_name.lower() not in story_state_name.lower():
+                                    continue
+                            else:
+                                continue
+                        
+                        # Apply owner filter if provided
+                        if owner_name:
+                            story_owners = story.get("owner_ids", [])
+                            if not story_owners:
+                                continue
+                                
+                            # Check if any of the owners match
+                            owner_match = False
+                            for owner_id in story_owners:
+                                owner_name_from_id = await get_member_name(owner_id)
+                                if owner_name.lower() in owner_name_from_id.lower():
+                                    owner_match = True
+                                    break
+                                    
+                            if not owner_match:
+                                continue
+                        
+                        # Apply requestor filter if provided
+                        if requestor_name:
+                            requestor_id = story.get("requested_by_id")
+                            if requestor_id:
+                                requestor_name_from_id = await get_member_name(requestor_id)
+                                if requestor_name.lower() not in requestor_name_from_id.lower():
+                                    continue
+                            else:
+                                continue
+                        
+                        # Story passed all filters
+                        filtered_stories.append(story)
+                    
+                    # Format the stories
+                    if filtered_stories:
+                        # Limit the number of stories to process to avoid timeouts
+                        max_stories = 10
+                        if len(filtered_stories) > max_stories:
+                            truncated_message = f"\n\n(Showing {max_stories} of {len(filtered_stories)} stories. Use more specific search criteria to narrow results.)"
+                            filtered_stories = filtered_stories[:max_stories]
+                        else:
+                            truncated_message = ""
+                        
+                        # Process stories in parallel for better performance
+                        formatted_stories = await asyncio.gather(*[format_story(story) for story in filtered_stories])
+                        
+                        # Join the formatted stories with a separator
+                        stories_text = "\n\n".join(formatted_stories)
+                        
+                        return [types.TextContent(
+                            type="text",
+                            text=f"Found {len(filtered_stories)} stories matching your criteria (using fallback search):{truncated_message}\n\n{stories_text}"
+                        )]
+                    else:
+                        return [types.TextContent(
+                            type="text",
+                            text="No stories found matching your criteria (using fallback search)."
+                        )]
+                except Exception as fallback_error:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Error searching for stories: {str(e)}\n\nFallback search also failed: {str(fallback_error)}\n\nTry using more specific search criteria or check the Shortcut API status."
+                    )]
+
         elif name == "advanced-search-stories":
             # Remove this handler since we've merged it with search-stories
             return [types.TextContent(
@@ -1872,6 +2294,101 @@ async def handle_call_tool(
                     text=f"Error updating story status: {str(e)}"
                 )]
 
+        elif name == "health-check":
+            # This tool is used to check the health and connectivity of the Shortcut MCP server
+            try:
+                # Test Shortcut API connectivity
+                start_time = time.time()
+                await make_shortcut_request("GET", "member", max_retries=1, base_timeout=10.0)
+                api_latency = time.time() - start_time
+                
+                # Get memory usage if psutil is available
+                memory_info = ""
+                try:
+                    import psutil
+                    process = psutil.Process(os.getpid())
+                    memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+                    memory_info = f"Memory Usage: {memory_usage:.1f} MB\n"
+                except ImportError:
+                    pass
+                
+                # Get uptime information
+                inactivity_time = shortcut_server.get_inactivity_time()
+                
+                # Get authenticated user info
+                user_info = "Not authenticated"
+                if shortcut_server.authenticated_user:
+                    user_info = shortcut_server.authenticated_user.get("name", "Unknown")
+                
+                return [types.TextContent(
+                    type="text",
+                    text=(
+                        f"✅ Shortcut MCP Server is healthy\n"
+                        f"API Latency: {api_latency:.2f}s\n"
+                        f"{memory_info}"
+                        f"Inactive for: {inactivity_time:.1f}s\n"
+                        f"Authenticated as: {user_info}\n"
+                        f"HTTP Client: {'Active' if http_client else 'Not initialized'}"
+                    )
+                )]
+            except Exception as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"❌ Shortcut MCP Server is experiencing issues: {str(e)}"
+                )]
+
+        elif name == "get-story":
+            # Get a specific story by ID
+            story_id = arguments.get("story_id")
+            if not story_id:
+                return [types.TextContent(
+                    type="text",
+                    text="Please provide a story ID."
+                )]
+            
+            try:
+                # Clean the story ID (remove any non-numeric characters)
+                original_id = story_id
+                story_id = re.sub(r'[^0-9]', '', story_id)
+                
+                if not story_id:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid story ID: '{original_id}'. Please provide a numeric ID."
+                    )]
+                
+                # Make a direct API call to get the story by ID (much faster than search)
+                try:
+                    story = await make_shortcut_request("GET", f"stories/{story_id}")
+                    
+                    # Format the story with more details since this is a direct lookup
+                    formatted_story = await format_story_detailed(story)
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Story details:\n\n{formatted_story}"
+                    )]
+                except ShortcutAPIError as e:
+                    if "404" in str(e):
+                        # If the story is not found, try to search for it
+                        return [types.TextContent(
+                            type="text",
+                            text=f"❌ Story with ID {story_id} not found. You might want to try searching for it using the search-stories tool."
+                        )]
+                    else:
+                        raise  # Re-raise the exception to be caught by the outer try-except
+            except ShortcutAPIError as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"❌ Error retrieving story: {e}"
+                )]
+            except Exception as e:
+                print(f"Unexpected error in get-story: {type(e).__name__}: {e}", file=sys.stderr)
+                return [types.TextContent(
+                    type="text",
+                    text=f"An unexpected error occurred while retrieving the story: {str(e)}"
+                )]
+
         else:
             return [types.TextContent(
                 type="text",
@@ -1889,19 +2406,68 @@ async def main():
     # Initialize server and authenticate
     await shortcut_server.initialize()
     
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await shortcut_server.server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="shortcut",
-                server_version="0.2.0",
-                capabilities=shortcut_server.server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+    # Set up a watchdog timer to detect and handle potential deadlocks
+    async def watchdog_timer():
+        while True:
+            await asyncio.sleep(60)  # Check every minute
+            
+            # Log that the server is still running
+            inactivity_time = shortcut_server.get_inactivity_time()
+            print(f"Watchdog timer: Server is still running (inactive for {inactivity_time:.1f} seconds)")
+            
+            # If the server has been inactive for too long (10 minutes), perform a health check
+            if inactivity_time > 600:
+                print("Server has been inactive for too long. Performing health check...")
+                try:
+                    # Try a simple API call to check if the connection is still working
+                    await make_shortcut_request("GET", "member", max_retries=1, base_timeout=10.0)
+                    print("Health check passed. Server is still responsive.")
+                except Exception as e:
+                    print(f"Health check failed: {str(e)}. Resetting connection...")
+                    # Reset the HTTP client
+                    await cleanup_http_client()
+                
+                # Reset the activity timer to avoid continuous health checks
+                shortcut_server.update_activity()
+    
+    # Create a task for the watchdog
+    watchdog_task = asyncio.create_task(watchdog_timer())
+    
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            # Set up a timeout for the server run
+            try:
+                await asyncio.wait_for(
+                    shortcut_server.server.run(
+                        read_stream,
+                        write_stream,
+                        InitializationOptions(
+                            server_name="shortcut",
+                            server_version="0.2.0",
+                            capabilities=shortcut_server.server.get_capabilities(
+                                notification_options=NotificationOptions(),
+                                experimental_capabilities={},
+                            ),
+                        ),
+                    ),
+                    timeout=None  # No timeout for the overall server, but individual operations will have timeouts
+                )
+            except asyncio.TimeoutError:
+                print("Server operation timed out. Restarting...")
+                # Instead of exiting, we could implement a restart mechanism here
+            except Exception as e:
+                print(f"Server error: {str(e)}")
+                raise
+    finally:
+        # Clean up the watchdog task
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        
+        # Clean up the HTTP client
+        await cleanup_http_client()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -14,10 +14,46 @@ This project is based on the original work by [Antonio Lorusso](https://github.c
 - Safe operations only (no updates or deletions)
 - Archived stories management (excluded by default, with option to include)
 
+## What's New in 0.2.1
+
+- **Team Management**: Added support for assigning teams to stories using `team_id` and `team_name` parameters
+- **New Tool**: Use the `list-teams` tool to see all available teams in your Shortcut workspace
+- **Improved Reliability**: Better handling of parameters and error conditions
+- **Enhanced Epic Support**: Improved support for linking stories to epics
+
 ## Installation
+
+### Standard Installation
 
 ```bash
 pip install shortcut-mcp
+```
+
+### MacOS Installation with Homebrew and pipx
+
+For MacOS users, we recommend using [Homebrew](https://brew.sh/) and [pipx](https://pypa.github.io/pipx/) for a cleaner installation:
+
+```bash
+# Install pipx if you don't have it already
+brew install pipx
+pipx ensurepath
+
+# Install shortcut-mcp
+pipx install shortcut-mcp
+```
+
+This method installs shortcut-mcp in an isolated environment, preventing dependency conflicts with other Python packages.
+
+### Upgrading
+
+To upgrade to the latest version:
+
+```bash
+# Standard upgrade
+pip install --upgrade shortcut-mcp
+
+# If installed with pipx
+pipx upgrade shortcut-mcp
 ```
 
 ## Quick Start
@@ -42,6 +78,7 @@ After setup, you can now use the Shortcut tools directly in Claude Desktop. Try 
 - `list-stories-by-state-name` - View stories in a specific state
 - `advanced-search-stories` - Find stories with multiple filters
 - `list-projects` - See all available projects
+- `list-teams` - View all teams in your Shortcut workspace
 - `search-stories` - Find stories by keywords
 - `list-archived-stories` - View archived stories
 - `list-my-archived-stories` - View your archived stories

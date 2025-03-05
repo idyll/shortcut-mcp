@@ -238,6 +238,36 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="list-archived-stories",
+            description="List only archived stories",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner_name": {
+                        "type": "string",
+                        "description": "Filter by owner name. Leave empty to see all archived stories."
+                    },
+                    "state_name": {
+                        "type": "string",
+                        "description": "Filter by workflow state name. Leave empty to see all states."
+                    }
+                }
+            }
+        ),
+        types.Tool(
+            name="list-my-archived-stories",
+            description="List only archived stories assigned to you",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "state_name": {
+                        "type": "string",
+                        "description": "Filter by workflow state name. Leave empty to see all states."
+                    }
+                }
+            }
+        ),
+        types.Tool(
             name="list-my-stories",
             description="List stories assigned to you",
             inputSchema={
@@ -927,7 +957,7 @@ async def handle_call_tool(
                         text=f"Could not find member with name '{owner_name}'"
                     )]
             
-            # Search for stories
+            # Search for stories with the specified workflow state
             stories = await make_shortcut_request(
                 "POST",
                 "stories/search",
@@ -962,8 +992,175 @@ async def handle_call_tool(
                 text=f"Stories in the '{state_name}' state{owner_msg}{archived_msg}:\n\n" + "\n".join(formatted_stories)
             )]
 
+        elif name == "list-archived-stories":
+            owner_name = arguments.get("owner_name")
+            state_name = arguments.get("state_name")
+            
+            # Prepare the search parameters - always set archived to true
+            search_json = {
+                "archived": True
+            }
+            
+            # If owner name is provided, find the owner ID
+            if owner_name:
+                # Get all members to find the owner ID
+                members = await make_shortcut_request("GET", "members")
+                owner_id = None
+                for member in members:
+                    if member.get("name", "").lower() == owner_name.lower() or member.get("mention_name", "").lower() == owner_name.lower():
+                        owner_id = member.get("id")
+                        break
+                
+                if owner_id:
+                    search_json["owner_ids"] = [owner_id]
+                else:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find member with name '{owner_name}'"
+                    )]
+            
+            # If state name is provided, find the workflow state ID
+            if state_name:
+                # Get all workflows to find the workflow state ID
+                workflows = await make_shortcut_request("GET", "workflows")
+                workflow_state_id = None
+                for workflow in workflows:
+                    for state in workflow.get("states", []):
+                        if state["name"].lower() == state_name.lower():
+                            workflow_state_id = state["id"]
+                            # Cache the state name
+                            workflow_states_cache[state["id"]] = state["name"]
+                            break
+                    if workflow_state_id:
+                        break
+                
+                if workflow_state_id:
+                    search_json["workflow_state_id"] = workflow_state_id
+                else:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find workflow state with name '{state_name}'"
+                    )]
+            
+            # Search for archived stories
+            stories = await make_shortcut_request(
+                "POST",
+                "stories/search",
+                json=search_json
+            )
+            
+            if not stories:
+                owner_msg = f" assigned to {owner_name}" if owner_name else ""
+                state_msg = f" in the '{state_name}' state" if state_name else ""
+                return [types.TextContent(
+                    type="text",
+                    text=f"No archived stories found{owner_msg}{state_msg}"
+                )]
+            
+            # Collect all unique workflow state IDs from the stories
+            workflow_state_ids = set()
+            for story in stories:
+                if story.get("workflow_state_id"):
+                    workflow_state_ids.add(story.get("workflow_state_id"))
+            
+            # Populate the cache with workflow state names
+            for state_id in workflow_state_ids:
+                if state_id not in workflow_states_cache:
+                    state_name_from_id = await get_workflow_state_name(state_id)
+                    workflow_states_cache[state_id] = state_name_from_id
+            
+            formatted_stories = [await format_story(story) for story in stories]
+            owner_msg = f" assigned to {owner_name}" if owner_name else ""
+            state_msg = f" in the '{state_name}' state" if state_name else ""
+            return [types.TextContent(
+                type="text",
+                text=f"Archived stories{owner_msg}{state_msg}:\n\n" + "\n".join(formatted_stories)
+            )]
+
+        elif name == "list-my-archived-stories":
+            state_name = arguments.get("state_name")
+            
+            # Get the authenticated user's ID
+            if not shortcut_server.authenticated_user:
+                return [types.TextContent(
+                    type="text",
+                    text="You need to be authenticated to use this tool"
+                )]
+            
+            user_id = shortcut_server.authenticated_user.get("id")
+            if not user_id:
+                return [types.TextContent(
+                    type="text",
+                    text="Could not determine your user ID"
+                )]
+            
+            # Prepare the search parameters - always set archived to true
+            search_json = {
+                "owner_ids": [user_id],
+                "archived": True
+            }
+            
+            # If state name is provided, find the workflow state ID
+            if state_name:
+                # Get all workflows to find the workflow state ID
+                workflows = await make_shortcut_request("GET", "workflows")
+                workflow_state_id = None
+                for workflow in workflows:
+                    for state in workflow.get("states", []):
+                        if state["name"].lower() == state_name.lower():
+                            workflow_state_id = state["id"]
+                            # Cache the state name
+                            workflow_states_cache[state["id"]] = state["name"]
+                            break
+                    if workflow_state_id:
+                        break
+                
+                if workflow_state_id:
+                    search_json["workflow_state_id"] = workflow_state_id
+                else:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find workflow state with name '{state_name}'"
+                    )]
+            
+            # Search for archived stories assigned to the user
+            stories = await make_shortcut_request(
+                "POST",
+                "stories/search",
+                json=search_json
+            )
+            
+            if not stories:
+                state_msg = f" in the '{state_name}' state" if state_name else ""
+                return [types.TextContent(
+                    type="text",
+                    text=f"No archived stories assigned to you{state_msg}"
+                )]
+            
+            # Collect all unique workflow state IDs from the stories
+            workflow_state_ids = set()
+            for story in stories:
+                if story.get("workflow_state_id"):
+                    workflow_state_ids.add(story.get("workflow_state_id"))
+            
+            # Populate the cache with workflow state names
+            for state_id in workflow_state_ids:
+                if state_id not in workflow_states_cache:
+                    state_name_from_id = await get_workflow_state_name(state_id)
+                    workflow_states_cache[state_id] = state_name_from_id
+            
+            formatted_stories = [await format_story(story) for story in stories]
+            state_msg = f" in the '{state_name}' state" if state_name else ""
+            return [types.TextContent(
+                type="text",
+                text=f"Archived stories assigned to you{state_msg}:\n\n" + "\n".join(formatted_stories)
+            )]
+
         else:
-            raise ValueError(f"Unknown tool: {name}")
+            return [types.TextContent(
+                type="text",
+                text=f"Unknown tool: {name}"
+            )]
 
     except httpx.HTTPError as e:
         return [types.TextContent(

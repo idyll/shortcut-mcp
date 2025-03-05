@@ -7,8 +7,16 @@ import os
 import sys
 import json
 import platform
+import importlib.metadata
 
 from . import server
+
+def get_version():
+    """Get the current version of the package."""
+    try:
+        return importlib.metadata.version("shortcut-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 def get_config_path():
     """Get Claude Desktop config path based on platform."""
@@ -69,6 +77,10 @@ def main():
         description="Shortcut MCP Server - Interact with Shortcut from Claude"
     )
     
+    parser.add_argument(
+        "--version", action="store_true", help="Show the version and exit"
+    )
+    
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     
     # Start command
@@ -87,6 +99,11 @@ def main():
     
     # Parse arguments
     args = parser.parse_args()
+    
+    # Handle version flag
+    if hasattr(args, "version") and args.version:
+        print(f"shortcut-mcp version {get_version()}")
+        sys.exit(0)
     
     # Default to start if no command specified
     if not args.command:

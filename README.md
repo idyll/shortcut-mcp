@@ -12,6 +12,7 @@ This project is based on the original work by [Antonio Lorusso](https://github.c
 - Search through stories with advanced filtering options
 - Create new stories, epics, and objectives
 - Safe operations only (no updates or deletions)
+- Archived stories management (excluded by default, with option to include)
 
 ## Installation
 
@@ -42,6 +43,8 @@ After setup, you can now use the Shortcut tools directly in Claude Desktop. Try 
 - `advanced-search-stories` - Find stories with multiple filters
 - `list-projects` - See all available projects
 - `search-stories` - Find stories by keywords
+- `list-archived-stories` - View archived stories
+- `list-my-archived-stories` - View your archived stories
 
 ## Manual Usage
 
@@ -205,6 +208,9 @@ The Shortcut MCP server provides powerful search capabilities through the `advan
 - **Time-based Filtering**: Find stories based on when they were created or updated
   - `created_after` / `created_before`: Filter by creation date
   - `updated_after` / `updated_before`: Filter by last update date
+- **Archived Stories**: All search tools exclude archived stories by default
+  - Use `include_archived: true` parameter to include archived stories
+  - Dedicated tools for working with archived stories: `list-archived-stories` and `list-my-archived-stories`
 
 ### Example Queries
 
@@ -213,6 +219,8 @@ In Claude, you can use commands like:
 - "Find stories requested by John but owned by Sarah"
 - "Show me stories in the Ready for Review state created in the last month"
 - "Search for stories updated after 2023-01-01 in the In Development state"
+- "List archived stories in the Done state"
+- "Show my archived stories from the last quarter"
 
 This makes it easy to find exactly the stories you're looking for, even in large projects with many tickets.
 

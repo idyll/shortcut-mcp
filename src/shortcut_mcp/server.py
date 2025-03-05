@@ -50,13 +50,17 @@ async def make_shortcut_request(
 ) -> dict[str, Any]:
     """Make an authenticated request to the Shortcut API with safety checks"""
     
-    # Safety check: Only allow GET and POST methods
-    if method not in ["GET", "POST"]:
-        raise ValueError(f"Method {method} is not allowed for safety reasons. Only GET and POST are permitted.")
+    # Safety check: Only allow GET, POST, and PUT methods
+    if method not in ["GET", "POST", "PUT"]:
+        raise ValueError(f"Method {method} is not allowed for safety reasons. Only GET, POST, and PUT are permitted.")
     
     # Safety check: POST requests are only allowed for creation endpoints and search endpoints
     if method == "POST" and not any(endpoint.endswith(x) for x in ["stories", "epics", "objectives", "search", "stories/search"]):
         raise ValueError(f"POST requests are only allowed for creation and search endpoints, not for {endpoint}")
+    
+    # Safety check: PUT requests are only allowed for updating stories
+    if method == "PUT" and not endpoint.startswith("stories/"):
+        raise ValueError(f"PUT requests are only allowed for updating stories, not for {endpoint}")
     
     if not SHORTCUT_API_TOKEN:
         raise ValueError("SHORTCUT_API_TOKEN environment variable not set")
@@ -87,38 +91,84 @@ async def make_shortcut_request(
 
 async def get_workflow_state_name(workflow_state_id: int) -> str:
     """Get the name of a workflow state by ID"""
-    # Check if we already have this state in the cache
+    # Check cache first
     if workflow_state_id in workflow_states_cache:
         return workflow_states_cache[workflow_state_id]
     
-    # Otherwise, fetch all workflows and find the state
+    # If not in cache, fetch from API
     workflows = await make_shortcut_request("GET", "workflows")
-    
     for workflow in workflows:
         for state in workflow.get("states", []):
-            if state["id"] == workflow_state_id:
+            if state.get("id") == workflow_state_id:
                 # Cache the result for future use
-                workflow_states_cache[workflow_state_id] = state["name"]
-                return state["name"]
+                workflow_states_cache[workflow_state_id] = state.get("name", "Unknown")
+                return state.get("name", "Unknown")
     
     return "Unknown"
 
 async def get_member_name(member_id: str) -> str:
     """Get the name of a member by ID"""
-    # Check if we already have this member in the cache
+    # Check cache first
     if member_id in members_cache:
         return members_cache[member_id]
     
-    # Otherwise, fetch all members and find the member
-    members = await make_shortcut_request("GET", "members")
+    # If not in cache, fetch from API
+    try:
+        member = await make_shortcut_request("GET", f"members/{member_id}")
+        name = member.get("name", member.get("mention_name", "Unknown"))
+        # Cache the result for future use
+        members_cache[member_id] = name
+        return name
+    except Exception:
+        return "Unknown"
+
+async def find_workflow_state_id(workflow_state_name: str) -> tuple[int, str]:
+    """Find a workflow state ID by name, with support for partial matching.
     
-    for member in members:
-        if member.get("id") == member_id:
-            # Cache the result for future use
-            members_cache[member_id] = member.get("name", "Unknown")
-            return member.get("name", "Unknown")
+    Returns:
+        tuple: (workflow_state_id, actual_state_name) or (None, None) if not found
+    """
+    workflows = await make_shortcut_request("GET", "workflows")
     
-    return "Unknown"
+    # First try exact match (case-insensitive)
+    for workflow in workflows:
+        for state in workflow.get("states", []):
+            if state["name"].lower() == workflow_state_name.lower():
+                workflow_state_id = state["id"]
+                # Cache the state name
+                workflow_states_cache[state["id"]] = state["name"]
+                return workflow_state_id, state["name"]
+    
+    # If no exact match, try partial match
+    for workflow in workflows:
+        for state in workflow.get("states", []):
+            if workflow_state_name.lower() in state["name"].lower():
+                workflow_state_id = state["id"]
+                # Cache the state name
+                workflow_states_cache[state["id"]] = state["name"]
+                return workflow_state_id, state["name"]
+    
+    return None, None
+
+async def find_epic_by_name(epic_name: str) -> tuple[int, str]:
+    """Find an epic by name, with support for partial matching.
+    
+    Returns:
+        tuple: (epic_id, actual_epic_name) or (None, None) if not found
+    """
+    epics = await make_shortcut_request("GET", "epics")
+    
+    # First try exact match (case-insensitive)
+    for epic in epics:
+        if epic.get("name", "").lower() == epic_name.lower():
+            return epic.get("id"), epic.get("name")
+    
+    # If no exact match, try partial match
+    for epic in epics:
+        if epic_name.lower() in epic.get("name", "").lower():
+            return epic.get("id"), epic.get("name")
+    
+    return None, None
 
 def format_objective(objective: dict) -> str:
     """Format an objective into a readable string"""
@@ -139,6 +189,15 @@ def format_epic(epic: dict) -> str:
         "---"
     )
 
+def format_team(team: dict) -> str:
+    """Format a team into a readable string"""
+    return (
+        f"Team ID: {team.get('id')}\n"
+        f"Name: {team.get('name')}\n"
+        f"Description: {team.get('description', 'No description')}\n"
+        f"Mention Name: {team.get('mention_name', 'None')}"
+    )
+
 async def format_story(story: dict) -> str:
     """Format a story into a readable string"""
     # Get the workflow state name asynchronously if needed
@@ -148,15 +207,41 @@ async def format_story(story: dict) -> str:
     # If we have the workflow state ID, try to get the name from cache
     if workflow_state_id is not None and workflow_state_id in workflow_states_cache:
         workflow_state_name = workflow_states_cache[workflow_state_id]
+    elif workflow_state_id is not None:
+        workflow_state_name = await get_workflow_state_name(workflow_state_id)
     
     # Get owner and requestor information
     owners = story.get("owner_ids", [])
     owner_names = []
     for owner_id in owners:
-        owner_name = await get_member_name(owner_id)
-        owner_names.append(owner_name)
+        if owner_id:  # Only process non-empty owner IDs
+            owner_name = await get_member_name(owner_id)
+            owner_names.append(owner_name)
     
     owner_info = f"Owners: {', '.join(owner_names)}" if owner_names else "No owners assigned"
+    
+    # Get team information
+    team_id = story.get("group_id")
+    team_info = "No team assigned"
+    if team_id:
+        try:
+            teams = await make_shortcut_request("GET", "groups")
+            for team in teams:
+                if team.get("id") == team_id:
+                    team_info = f"Team: {team.get('name', 'Unknown')}"
+                    break
+        except Exception:
+            pass
+    
+    # Get epic information
+    epic_id = story.get("epic_id")
+    epic_info = "No epic assigned"
+    if epic_id:
+        try:
+            epic = await make_shortcut_request("GET", f"epics/{epic_id}")
+            epic_info = f"Epic: {epic.get('name', 'Unknown')} (ID: {epic_id})"
+        except Exception:
+            pass
     
     requestor_id = story.get("requested_by_id")
     requestor_name = "Unknown"
@@ -174,6 +259,8 @@ async def format_story(story: dict) -> str:
         f"Status: {workflow_state_name}\n"
         f"Type: {story.get('story_type', 'Unknown')}\n"
         f"{owner_info}\n"
+        f"{team_info}\n"
+        f"{epic_info}\n"
         f"{requestor_info}\n"
         f"Created: {created_at}\n"
         f"Updated: {updated_at}\n"
@@ -329,8 +416,24 @@ async def handle_list_tools() -> list[types.Tool]:
                         "type": "number",
                         "description": "Project ID to create the story in",
                     },
+                    "project_name": {
+                        "type": "string",
+                        "description": "Project name to create the story in (alternative to project_id)",
+                    },
+                    "epic_id": {
+                        "type": "number",
+                        "description": "Epic ID to associate with the story",
+                    },
+                    "epic_name": {
+                        "type": "string",
+                        "description": "Epic name to associate with the story (alternative to epic_id)",
+                    },
+                    "workflow_state_name": {
+                        "type": "string",
+                        "description": "Workflow state name (e.g., 'Backlog', 'In Development'). Defaults to 'Backlog' if not specified.",
+                    },
                 },
-                "required": ["name", "description", "story_type", "project_id"],
+                "required": ["name", "description", "story_type"],
             },
         ),
         types.Tool(
@@ -338,7 +441,21 @@ async def handle_list_tools() -> list[types.Tool]:
             description="List all projects in Shortcut",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    # Add any optional parameters here if needed in the future
+                },
+                # No required parameters
+            },
+        ),
+        types.Tool(
+            name="list-teams",
+            description="List all teams in Shortcut",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    # Add any optional parameters here if needed in the future
+                },
+                # No required parameters
             },
         ),
         types.Tool(
@@ -346,7 +463,10 @@ async def handle_list_tools() -> list[types.Tool]:
             description="List all workflows and their states",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    # Add any optional parameters here if needed in the future
+                },
+                # No required parameters
             },
         ),
         types.Tool(
@@ -444,6 +564,101 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["workflow_state_id"],
             },
         ),
+        types.Tool(
+            name="update-story",
+            description=f"Update an existing story in Shortcut{user_info}",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "story_id": {
+                        "type": "string",
+                        "description": "Story ID to update",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New story title",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New story description",
+                    },
+                    "story_type": {
+                        "type": "string",
+                        "description": "New story type (feature, bug, chore)",
+                        "enum": ["feature", "bug", "chore"],
+                    },
+                    "workflow_state_name": {
+                        "type": "string",
+                        "description": "New workflow state name (e.g., 'Backlog', 'In Development')",
+                    },
+                    "project_id": {
+                        "type": "number",
+                        "description": "New project ID for the story",
+                    },
+                    "project_name": {
+                        "type": "string",
+                        "description": "New project name for the story (alternative to project_id)",
+                    },
+                    "epic_id": {
+                        "type": "number",
+                        "description": "New epic ID for the story",
+                    },
+                    "epic_name": {
+                        "type": "string",
+                        "description": "New epic name for the story",
+                    },
+                    "team_id": {
+                        "type": "number",
+                        "description": "New team ID for the story (group_id in Shortcut API)",
+                    },
+                    "team_name": {
+                        "type": "string",
+                        "description": "New team name for the story (alternative to team_id)",
+                    },
+                },
+                "required": ["story_id"],
+            },
+        ),
+        types.Tool(
+            name="update-story-status",
+            description=f"Update a story's status in Shortcut{user_info}",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "story_id": {
+                        "type": "string",
+                        "description": "Story ID to update",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "New status for the story (e.g., 'Backlog', 'In Development')",
+                    },
+                },
+                "required": ["story_id", "status"],
+            },
+        ),
+        types.Tool(
+            name="create-team",
+            description=f"Create a new team in Shortcut{user_info}",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Team name",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Team description",
+                    },
+                    "mention_name": {
+                        "type": "string",
+                        "description": "Team mention name (used for @mentions)",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
     ]
 
 @shortcut_server.server.call_tool()
@@ -452,8 +667,9 @@ async def handle_call_tool(
     arguments: dict | None
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
     """Handle tool execution requests"""
-    if not arguments:
-        raise ValueError("Missing arguments")
+    # Initialize arguments as an empty dictionary if it's None
+    if arguments is None:
+        arguments = {}
 
     try:
         if name == "search-stories":
@@ -640,12 +856,210 @@ async def handle_call_tool(
             )]
 
         elif name == "create-story":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
+            project_id = arguments.get("project_id")
+            project_name = arguments.get("project_name")
+            epic_id = arguments.get("epic_id")
+            epic_name = arguments.get("epic_name")
+            
+            # If neither project_id nor project_name is provided, list projects and ask user to select one
+            if not project_id and not project_name:
+                projects = await make_shortcut_request("GET", "projects")
+                
+                formatted_projects = []
+                for project in projects:
+                    formatted_projects.append(
+                        f"Project ID: {project['id']}\n"
+                        f"Name: {project['name']}\n"
+                        f"Description: {project.get('description', 'No description')}\n"
+                        "---"
+                    )
+
+                return [types.TextContent(
+                    type="text",
+                    text="Please provide either a project ID or project name from the list below and try again:\n\n" + 
+                         "\n".join(formatted_projects)
+                )]
+            
+            # If project_name is provided, find the corresponding project_id
+            if project_name and not project_id:
+                projects = await make_shortcut_request("GET", "projects")
+                for project in projects:
+                    if project.get("name", "").lower() == project_name.lower():
+                        project_id = project.get("id")
+                        break
+                
+                if not project_id:
+                    # If we couldn't find the project, list available projects
+                    formatted_projects = []
+                    for project in projects:
+                        formatted_projects.append(
+                            f"Project ID: {project['id']}\n"
+                            f"Name: {project['name']}\n"
+                            f"Description: {project.get('description', 'No description')}\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find project with name '{project_name}'. Available projects:\n\n" + 
+                             "\n".join(formatted_projects)
+                    )]
+            
+            # If epic_name is provided, find the corresponding epic_id
+            if epic_name and not epic_id:
+                epic_id, actual_epic_name = await find_epic_by_name(epic_name)
+                
+                if not epic_id:
+                    # If we couldn't find the epic, list available epics
+                    epics = await make_shortcut_request("GET", "epics")
+                    formatted_epics = []
+                    for epic in epics:
+                        formatted_epics.append(
+                            f"Epic ID: {epic['id']}\n"
+                            f"Name: {epic['name']}\n"
+                            f"Status: {epic.get('status', 'Unknown')}\n"
+                            f"Description: {epic.get('description', 'No description')}\n"
+                            f"URL: {epic.get('app_url', '')}\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find epic with name '{epic_name}'. Available epics:\n\n" + 
+                             "\n".join(formatted_epics)
+                    )]
+            
+            # Get the workflow state ID for "Backlog" or the specified state
+            workflow_state_name = arguments.get("workflow_state_name", "Backlog")
+            workflow_state_id, actual_state_name = await find_workflow_state_id(workflow_state_name)
+            
+            if not workflow_state_id:
+                # If we couldn't find the specified state, list available states
+                workflows = await make_shortcut_request("GET", "workflows")
+                formatted_workflows = []
+                for workflow in workflows:
+                    states = [
+                        f"- {state['name']} (ID: {state['id']})"
+                        for state in workflow.get("states", [])
+                    ]
+                    
+                    formatted_workflows.append(
+                        f"Workflow: {workflow['name']}\n"
+                        f"States:\n" + "\n".join(states) + "\n"
+                        "---"
+                    )
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Could not find workflow state '{workflow_state_name}'. Available states:\n\n" + 
+                         "\n".join(formatted_workflows)
+                )]
+            
+            # Prepare story data
             story_data = {
                 "name": arguments["name"],
                 "description": arguments["description"],
                 "story_type": arguments["story_type"],
-                "project_id": arguments["project_id"],
+                "project_id": project_id,
+                "workflow_state_id": workflow_state_id,
             }
+            
+            # Add epic_id if provided
+            if epic_id := arguments.get("epic_id"):
+                try:
+                    # Convert epic_id to integer if it's a string or any other type
+                    epic_id = int(epic_id)
+                    story_data["epic_id"] = epic_id
+                except (ValueError, TypeError):
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid epic_id: {epic_id}. Must be a valid integer."
+                    )]
+            
+            # Handle epic_name if provided
+            if epic_name := arguments.get("epic_name"):
+                # Get all epics to find the epic ID
+                epics = await make_shortcut_request("GET", "epics")
+                found_epic_id = None
+                for epic in epics:
+                    if epic.get("name", "").lower() == epic_name.lower():
+                        found_epic_id = epic.get("id")
+                        break
+                
+                if found_epic_id:
+                    story_data["epic_id"] = found_epic_id
+                else:
+                    # If we couldn't find the epic, list available epics
+                    formatted_epics = []
+                    for epic in epics:
+                        formatted_epics.append(
+                            f"Epic ID: {epic['id']}\n"
+                            f"Name: {epic['name']}\n"
+                            f"Description: {epic.get('description', 'No description')}\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find epic with name '{epic_name}'. Available epics:\n\n" + 
+                             "\n".join(formatted_epics)
+                    )]
+            
+            # Handle team_id if provided (maps to group_id in Shortcut API)
+            if team_id := arguments.get("team_id"):
+                try:
+                    # Convert team_id to integer if it's a string or any other type
+                    team_id = int(team_id)
+                    story_data["group_id"] = team_id
+                except (ValueError, TypeError):
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid team_id: {team_id}. Must be a valid integer."
+                    )]
+                    
+            # Handle team_name if provided
+            if team_name := arguments.get("team_name"):
+                # Get all groups (teams) to find the team ID
+                groups = await make_shortcut_request("GET", "groups")
+                found_group_id = None
+                for group in groups:
+                    if group.get("name", "").lower() == team_name.lower():
+                        found_group_id = group.get("id")
+                        break
+                
+                if found_group_id:
+                    story_data["group_id"] = found_group_id
+                else:
+                    # If we couldn't find the team, list available teams
+                    formatted_groups = []
+                    for group in groups:
+                        formatted_groups.append(
+                            f"Team ID: {group['id']}\n"
+                            f"Name: {group['name']}\n"
+                            f"Description: {group.get('description', 'No description')}\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find team with name '{team_name}'. Available teams:\n\n" + 
+                             "\n".join(formatted_groups)
+                    )]
+            
+            # Assign to authenticated user if available
+            if shortcut_server.authenticated_user:
+                user_id = shortcut_server.authenticated_user.get("id")
+                if user_id:
+                    story_data["owner_ids"] = [user_id]
+                
+                # Assign to the user's team if available
+                team_ids = shortcut_server.authenticated_user.get("group_ids", [])
+                if team_ids and len(team_ids) > 0:
+                    story_data["group_id"] = team_ids[0]  # Assign to the first team if multiple
 
             new_story = await make_shortcut_request(
                 "POST",
@@ -659,6 +1073,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-projects":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             projects = await make_shortcut_request("GET", "projects")
             
             formatted_projects = []
@@ -675,7 +1093,32 @@ async def handle_call_tool(
                 text="Available projects:\n\n" + "\n".join(formatted_projects)
             )]
 
+        elif name == "list-teams":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
+            groups = await make_shortcut_request("GET", "groups")
+            
+            formatted_teams = []
+            for group in groups:
+                formatted_teams.append(
+                    f"Team ID: {group['id']}\n"
+                    f"Name: {group['name']}\n"
+                    f"Description: {group.get('description', 'No description')}\n"
+                    "---"
+                )
+
+            return [types.TextContent(
+                type="text",
+                text="Available teams:\n\n" + "\n".join(formatted_teams)
+            )]
+
         elif name == "list-workflows":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             workflows = await make_shortcut_request("GET", "workflows")
             
             formatted_workflows = []
@@ -697,6 +1140,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-objectives":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             params = {}
             if status := arguments.get("status"):
                 params["status"] = status
@@ -716,10 +1163,14 @@ async def handle_call_tool(
             )]
 
         elif name == "create-objective":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             objective_data = {
-                "name": arguments["name"],
-                "description": arguments["description"],
-                "status": arguments["status"],
+                "name": arguments.get("name"),
+                "description": arguments.get("description"),
+                "status": arguments.get("status"),
             }
 
             new_objective = await make_shortcut_request(
@@ -734,6 +1185,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-epics":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             params = {}
             if status := arguments.get("status"):
                 params["status"] = status
@@ -746,16 +1201,30 @@ async def handle_call_tool(
                     text="No epics found"
                 )]
 
-            formatted_epics = [format_epic(epic) for epic in epics]
+            formatted_epics = []
+            for epic in epics:
+                formatted_epics.append(
+                    f"Epic ID: {epic['id']}\n"
+                    f"Name: {epic['name']}\n"
+                    f"Status: {epic.get('status', 'Unknown')}\n"
+                    f"Description: {epic.get('description', 'No description')}\n"
+                    f"URL: {epic.get('app_url', '')}\n"
+                    "---"
+                )
+            
             return [types.TextContent(
                 type="text",
                 text="Epics:\n\n" + "\n".join(formatted_epics)
             )]
 
         elif name == "create-epic":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             epic_data = {
-                "name": arguments["name"],
-                "description": arguments["description"],
+                "name": arguments.get("name"),
+                "description": arguments.get("description"),
             }
 
             if milestone_id := arguments.get("milestone_id"):
@@ -773,6 +1242,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-stories-by-status":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             workflow_state_id = arguments.get("workflow_state_id")
             owner_name = arguments.get("owner_name")
             include_archived = arguments.get("include_archived", False)
@@ -829,6 +1302,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-my-stories":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             state_name = arguments.get("state")
             include_archived = arguments.get("include_archived", False)
             
@@ -904,6 +1381,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-stories-by-state-name":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             state_name = arguments.get("state_name")
             owner_name = arguments.get("owner_name")
             include_archived = arguments.get("include_archived", False)
@@ -1078,6 +1559,10 @@ async def handle_call_tool(
             )]
 
         elif name == "list-my-archived-stories":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
             state_name = arguments.get("state_name")
             
             # Get the authenticated user's ID
@@ -1155,6 +1640,309 @@ async def handle_call_tool(
                 type="text",
                 text=f"Archived stories assigned to you{state_msg}:\n\n" + "\n".join(formatted_stories)
             )]
+
+        elif name == "update-story":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
+            story_id = arguments.get("story_id")
+            
+            if not story_id:
+                return [types.TextContent(
+                    type="text",
+                    text="Please provide a story ID"
+                )]
+                
+            # Ensure story_id is a string
+            story_id = str(story_id)
+            
+            # First, get the current story to update only the fields that are provided
+            try:
+                current_story = await make_shortcut_request("GET", f"stories/{story_id}")
+            except Exception as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"Error retrieving story {story_id}: {str(e)}"
+                )]
+            
+            # Prepare story data with only the fields that are provided
+            story_data = {}
+            
+            if name := arguments.get("name"):
+                story_data["name"] = name
+                
+            if description := arguments.get("description"):
+                story_data["description"] = description
+                
+            if story_type := arguments.get("story_type"):
+                story_data["story_type"] = story_type
+                
+            if project_id := arguments.get("project_id"):
+                try:
+                    # Convert project_id to integer if it's a string or any other type
+                    project_id = int(project_id)
+                    story_data["project_id"] = project_id
+                except (ValueError, TypeError):
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid project_id: {project_id}. Must be a valid integer."
+                    )]
+                
+            # Handle epic_id if provided
+            if epic_id := arguments.get("epic_id"):
+                try:
+                    # Convert epic_id to integer if it's a string or any other type
+                    epic_id = int(epic_id)
+                    story_data["epic_id"] = epic_id
+                except (ValueError, TypeError):
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid epic_id: {epic_id}. Must be a valid integer."
+                    )]
+                
+            # Handle epic_name if provided
+            if epic_name := arguments.get("epic_name"):
+                # Get all epics to find the epic ID
+                epics = await make_shortcut_request("GET", "epics")
+                found_epic_id = None
+                for epic in epics:
+                    if epic.get("name", "").lower() == epic_name.lower():
+                        found_epic_id = epic.get("id")
+                        break
+                
+                if found_epic_id:
+                    story_data["epic_id"] = found_epic_id
+                else:
+                    # If we couldn't find the epic, list available epics
+                    formatted_epics = []
+                    for epic in epics:
+                        formatted_epics.append(
+                            f"Epic ID: {epic['id']}\n"
+                            f"Name: {epic['name']}\n"
+                            f"Description: {epic.get('description', 'No description')}\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find epic with name '{epic_name}'. Available epics:\n\n" + 
+                             "\n".join(formatted_epics)
+                    )]
+            
+            # Handle team_id if provided (maps to group_id in Shortcut API)
+            if team_id := arguments.get("team_id"):
+                try:
+                    # Convert team_id to integer if it's a string or any other type
+                    team_id = int(team_id)
+                    story_data["group_id"] = team_id
+                except (ValueError, TypeError):
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Invalid team_id: {team_id}. Must be a valid integer."
+                    )]
+                    
+            # Handle team_name if provided
+            if team_name := arguments.get("team_name"):
+                # Get all groups (teams) to find the team ID
+                groups = await make_shortcut_request("GET", "groups")
+                found_group_id = None
+                for group in groups:
+                    if group.get("name", "").lower() == team_name.lower():
+                        found_group_id = group.get("id")
+                        break
+                
+                if found_group_id:
+                    story_data["group_id"] = found_group_id
+                else:
+                    # If we couldn't find the team, list available teams
+                    formatted_groups = []
+                    for group in groups:
+                        formatted_groups.append(
+                            f"Team ID: {group['id']}\n"
+                            f"Name: {group['name']}\n"
+                            f"Description: {group.get('description', 'No description')}\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find team with name '{team_name}'. Available teams:\n\n" + 
+                             "\n".join(formatted_groups)
+                    )]
+            
+            # Handle workflow state name if provided
+            if workflow_state_name := arguments.get("workflow_state_name"):
+                # Get the workflow state ID for the specified state
+                workflow_state_id, actual_state_name = await find_workflow_state_id(workflow_state_name)
+                
+                if workflow_state_id:
+                    story_data["workflow_state_id"] = workflow_state_id
+                else:
+                    # If we couldn't find the state, list available states
+                    workflows = await make_shortcut_request("GET", "workflows")
+                    formatted_workflows = []
+                    for workflow in workflows:
+                        states = [
+                            f"- {state['name']} (ID: {state['id']})"
+                            for state in workflow.get("states", [])
+                        ]
+                        
+                        formatted_workflows.append(
+                            f"Workflow: {workflow['name']}\n"
+                            f"States:\n" + "\n".join(states) + "\n"
+                            "---"
+                        )
+                    
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Could not find workflow state with name '{workflow_state_name}'. Available states:\n\n" + 
+                             "\n".join(formatted_workflows)
+                    )]
+            
+            if not story_data:
+                return [types.TextContent(
+                    type="text",
+                    text="No fields to update were provided"
+                )]
+            
+            # Update the story
+            try:
+                updated_story = await make_shortcut_request(
+                    "PUT",
+                    f"stories/{story_id}",
+                    json=story_data
+                )
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Updated story:\n\n{await format_story(updated_story)}"
+                )]
+            except Exception as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"Error updating story: {str(e)}"
+                )]
+
+        elif name == "update-story-status":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
+            story_id = arguments.get("story_id")
+            status = arguments.get("status")
+            
+            if not story_id:
+                return [types.TextContent(
+                    type="text",
+                    text="Please provide a story ID"
+                )]
+                
+            # Ensure story_id is a string
+            story_id = str(story_id)
+            
+            if not status:
+                return [types.TextContent(
+                    type="text",
+                    text="Please provide a new status for the story"
+                )]
+            
+            # First, get the current story to update only the fields that are provided
+            try:
+                current_story = await make_shortcut_request("GET", f"stories/{story_id}")
+            except Exception as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"Error retrieving story {story_id}: {str(e)}"
+                )]
+            
+            # Find the workflow state ID for the provided status
+            workflow_state_id, actual_state_name = await find_workflow_state_id(status)
+            
+            if not workflow_state_id:
+                # If we couldn't find the state, list available states
+                workflows = await make_shortcut_request("GET", "workflows")
+                formatted_workflows = []
+                for workflow in workflows:
+                    states = [
+                        f"- {state['name']} (ID: {state['id']})"
+                        for state in workflow.get("states", [])
+                    ]
+                    
+                    formatted_workflows.append(
+                        f"Workflow: {workflow['name']}\n"
+                        f"States:\n" + "\n".join(states) + "\n"
+                        "---"
+                    )
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Could not find workflow state with name '{status}'. Available states:\n\n" + 
+                         "\n".join(formatted_workflows)
+                )]
+            
+            # Prepare story data with only the workflow state ID
+            story_data = {
+                "workflow_state_id": workflow_state_id
+            }
+            
+            # Update the story
+            try:
+                updated_story = await make_shortcut_request(
+                    "PUT",
+                    f"stories/{story_id}",
+                    json=story_data
+                )
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Updated story status to '{actual_state_name}':\n\n{await format_story(updated_story)}"
+                )]
+            except Exception as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"Error updating story status: {str(e)}"
+                )]
+
+        elif name == "create-team":
+            # Ensure arguments is a dictionary even if None was passed
+            if arguments is None:
+                arguments = {}
+                
+            name = arguments.get("name")
+            if not name:
+                return [types.TextContent(
+                    type="text",
+                    text="Please provide a team name"
+                )]
+                
+            team_data = {
+                "name": name,
+            }
+            
+            # Add optional fields if provided
+            if description := arguments.get("description"):
+                team_data["description"] = description
+                
+            if mention_name := arguments.get("mention_name"):
+                team_data["mention_name"] = mention_name
+            
+            try:
+                new_team = await make_shortcut_request(
+                    "POST",
+                    "groups",  # The Shortcut API endpoint for teams is "groups"
+                    json=team_data
+                )
+                
+                return [types.TextContent(
+                    type="text",
+                    text=f"Created new team:\n\n{format_team(new_team)}"
+                )]
+            except Exception as e:
+                return [types.TextContent(
+                    type="text",
+                    text=f"Error creating team: {str(e)}"
+                )]
 
         else:
             return [types.TextContent(

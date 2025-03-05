@@ -2443,7 +2443,7 @@ async def main():
                         write_stream,
                         InitializationOptions(
                             server_name="shortcut",
-                            server_version="0.2.0",
+                            server_version="0.2.2",
                             capabilities=shortcut_server.server.get_capabilities(
                                 notification_options=NotificationOptions(),
                                 experimental_capabilities={},

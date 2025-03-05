@@ -14,6 +14,13 @@ This project is based on the original work by [Antonio Lorusso](https://github.c
 - Safe operations only (no updates or deletions)
 - Archived stories management (excluded by default, with option to include)
 
+## What's New in 0.2.2
+
+- **Enhanced Search Functionality**: Improved search capabilities with support for Shortcut's native query syntax
+- **Advanced Query Operators**: Support for operators like `type:`, `state:`, `owner:`, `label:`, and more
+- **Better Error Handling**: More detailed error messages and improved fallback mechanisms
+- **Robust Story ID Handling**: Better handling of non-numeric characters in story IDs
+
 ## What's New in 0.2.1
 
 - **Team Management**: Added support for assigning teams to stories using `team_id` and `team_name` parameters
